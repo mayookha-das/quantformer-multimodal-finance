@@ -86,8 +86,8 @@ try:
             f"Ask: {order_book['asks'][0]['price']}"
         )
 
-        # Approximately 10 updates per second
-        time.sleep(0.1)
+        # Approximately 20 updates per second
+        time.sleep(0.05)
 
 except KeyboardInterrupt:
     print("\nOrder Book Producer stopped.")
