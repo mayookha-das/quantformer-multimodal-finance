@@ -6,3 +6,4 @@ __pycache__/
 .venv312/
 frontend/node_modules/
 frontend/dist/
+backend/data/*.jsonl
