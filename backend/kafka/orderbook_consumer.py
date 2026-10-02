@@ -1,3 +1,4 @@
+from pathlib import Path
 import json
 
 from kafka import KafkaConsumer
@@ -8,6 +9,14 @@ from backend.preprocessing.orderbook_features import extract_orderbook_features
 # Kafka configuration
 KAFKA_SERVER = "localhost:9092"
 TOPIC_NAME = "orderbook"
+
+OUTPUT_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "processed_orderbook.jsonl"
+)
+
+OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
 # Create Kafka consumer
@@ -32,6 +41,21 @@ try:
 
         # Extract quantitative features
         features = extract_orderbook_features(order_book)
+
+        processed_orderbook = {
+            "timestamp": features["timestamp"],
+            "symbol": features["symbol"],
+            "mid_price": features["mid_price"],
+            "spread": features["spread"],
+            "best_bid": features["best_bid"],
+            "best_ask": features["best_ask"],
+            "total_bid_volume": features["total_bid_volume"],
+            "total_ask_volume": features["total_ask_volume"],
+            "orderbook_imbalance": features["orderbook_imbalance"],
+        }
+
+        with OUTPUT_FILE.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(processed_orderbook) + "\n")
 
         print(
             f"Time: {features['timestamp']} | "
