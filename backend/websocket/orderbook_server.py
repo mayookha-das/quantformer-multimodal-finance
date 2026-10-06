@@ -50,7 +50,7 @@ async def send_orderbook():
                     ],
                     return_exceptions=True,
                 )
-
+            await asyncio.sleep(0)
     except asyncio.CancelledError:
         pass
 
