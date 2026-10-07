@@ -1,7 +1,7 @@
 from pathlib import Path
 import json
 
-from kafka import KafkaConsumer
+from confluent_kafka import Consumer
 
 from backend.preprocessing.orderbook_features import extract_orderbook_features
 
@@ -20,14 +20,15 @@ OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
 # Create Kafka consumer
-consumer = KafkaConsumer(
-    TOPIC_NAME,
-    bootstrap_servers=KAFKA_SERVER,
-    auto_offset_reset="latest",
-    enable_auto_commit=True,
-    group_id="quantformer-feature-consumer",
-    value_deserializer=lambda value: json.loads(value.decode("utf-8"))
-)
+consumer_config = {
+    "bootstrap.servers": KAFKA_SERVER,
+    "group.id": "quantformer-feature-consumer",
+    "auto.offset.reset": "latest",
+    "enable.auto.commit": True,
+}
+
+consumer = Consumer(consumer_config)
+consumer.subscribe([TOPIC_NAME])
 
 
 print("QuantFormer Order Book Feature Consumer Started...")
@@ -35,9 +36,18 @@ print("Listening for order-book data...\n")
 
 
 try:
-    for message in consumer:
+    while True:
 
-        order_book = message.value
+        message = consumer.poll(1.0)
+
+        if message is None:
+            continue
+
+        if message.error():
+            print(f"Kafka error: {message.error()}")
+            continue
+
+        order_book = json.loads(message.value().decode("utf-8"))
 
         # Extract quantitative features
         features = extract_orderbook_features(order_book)

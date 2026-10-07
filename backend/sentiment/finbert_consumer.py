@@ -65,7 +65,7 @@ def generate_embedding(text):
     return embedding.tolist()
 consumer = Consumer({
     "bootstrap.servers": KAFKA_SERVER,
-    "group.id": "quantformer-finbert-consumer",
+    "group.id": "quantformer-finbert-week3",
     "auto.offset.reset": "latest",
 })
 
