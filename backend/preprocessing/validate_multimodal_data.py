@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import torch
-
+import pandas as pd
 
 DATA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -125,5 +125,52 @@ def validate_data():
         print("\nValidation FAILED!")
 
 
+def validate_tft_dataset():
+    tft_file = (
+        Path(__file__).resolve().parents[1]
+        / "data"
+        / "tft_minute_data.csv"
+    )
+
+    if not tft_file.exists():
+        print("\nTFT dataset not found.")
+        return
+
+    df = pd.read_csv(tft_file)
+
+    required_columns = [
+        "time_idx",
+        "timestamp",
+        "mid_price",
+        "sentiment_score",
+        "target_price_5min",
+    ]
+
+    missing_columns = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
+
+    print("\nTFT Dataset Validation")
+    print("----------------------")
+    print("Records:", len(df))
+    print("Missing columns:", missing_columns)
+    print("Missing values:", int(df[required_columns].isna().sum().sum())
+          if not missing_columns else "Not checked")
+
+    if (
+        len(df) > 5
+        and not missing_columns
+        and not df[required_columns].isna().any().any()
+        and df["time_idx"].is_unique
+        and df["time_idx"].tolist() == list(range(len(df)))
+    ):
+        print("TFT dataset validation PASSED!")
+    else:
+        print("TFT dataset validation FAILED!")
+
+
+
 if __name__ == "__main__":
     validate_data()
+    validate_tft_dataset()
