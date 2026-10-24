@@ -13,7 +13,7 @@ WEBSOCKET_PORT = 8765
 
 consumer = Consumer({
     "bootstrap.servers": KAFKA_SERVER,
-    "group.id": "quantformer-websocket",
+    "group.id": "quantformer-websocket-v2",
     "auto.offset.reset": "latest",
 })
 

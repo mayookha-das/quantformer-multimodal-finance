@@ -1,9 +1,34 @@
+
+# Python environments
 .venv/
-__pycache__/
-*.pyc
-.env
-.vscode/
 .venv312/
+env/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+
+# IDE settings
+.vscode/
+
+# Frontend dependencies and build output
 frontend/node_modules/
 frontend/dist/
+
+# Raw and generated data
 backend/data/*.jsonl
+backend/data/tft_minute_data.csv
+
+# Trained models and checkpoints
+backend/models/
+
+# Training logs
+lightning_logs/
+
+# Environment variables and secrets
+.env
+.env.*
+
+# OS-generated files
+.DS_Store
+Thumbs.db
