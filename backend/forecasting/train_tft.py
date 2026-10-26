@@ -1,6 +1,7 @@
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import lightning.pytorch as pl
@@ -18,7 +19,6 @@ from pytorch_forecasting.metrics import MAE
 # ---------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
 DATA_FILE = PROJECT_ROOT / "backend" / "data" / "tft_minute_data.csv"
 MODEL_DIR = PROJECT_ROOT / "backend" / "models"
 
@@ -35,12 +35,10 @@ RANDOM_SEED = 42
 # ---------------------------------------------------------
 
 def load_and_prepare_data():
-    """Load data while preserving recording sessions."""
+    """Load data while preserving recording-session boundaries."""
 
     if not DATA_FILE.exists():
-        raise FileNotFoundError(
-            f"TFT dataset not found: {DATA_FILE}"
-        )
+        raise FileNotFoundError(f"TFT dataset not found: {DATA_FILE}")
 
     df = pd.read_csv(DATA_FILE)
 
@@ -57,21 +55,12 @@ def load_and_prepare_data():
         "sentiment_score",
     ]
 
-    missing = [
-        column
-        for column in required_columns
-        if column not in df.columns
-    ]
-
+    missing = [column for column in required_columns if column not in df.columns]
     if missing:
-        raise ValueError(
-            f"Missing required columns: {missing}"
-        )
+        raise ValueError(f"Missing required columns: {missing}")
 
     df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        utc=True,
-        errors="coerce",
+        df["timestamp"], utc=True, errors="coerce"
     )
 
     numeric_columns = [
@@ -86,109 +75,62 @@ def load_and_prepare_data():
     ]
 
     for column in numeric_columns:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
-        )
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    df = df.dropna(
-        subset=required_columns
-    ).copy()
+    df = df.dropna(subset=required_columns).copy()
 
     if df.empty:
-        raise ValueError(
-            "No valid rows remain after cleaning the dataset."
-        )
+        raise ValueError("No valid rows remain after cleaning the dataset.")
 
-    # Reconstruct recording sessions if session_id is absent.
+    # Reconstruct sessions if session_id is unavailable.
     if "session_id" not in df.columns:
-        df = df.sort_values(
-            "timestamp"
-        ).reset_index(drop=True)
-
-        time_gap = df["timestamp"].diff()
-
-        starts_session = (
-            time_gap.isna()
-            | time_gap.ne(pd.Timedelta(minutes=1))
-        )
-
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        gaps = df["timestamp"].diff()
+        starts_session = gaps.isna() | gaps.ne(pd.Timedelta(minutes=1))
         df["session_id"] = starts_session.cumsum()
 
-    df["session_id"] = pd.to_numeric(
-        df["session_id"],
-        errors="coerce",
-    )
-
-    df = df.dropna(
-        subset=["session_id"]
-    ).copy()
-
+    df["session_id"] = pd.to_numeric(df["session_id"], errors="coerce")
+    df = df.dropna(subset=["session_id"]).copy()
     df["session_id"] = df["session_id"].astype(int)
 
-    df = df.sort_values(
-        ["session_id", "timestamp"]
-    ).reset_index(drop=True)
+    df = df.sort_values(["session_id", "timestamp"]).reset_index(drop=True)
 
-    # Each recording session gets its own zero-based time index.
-    df["time_idx"] = (
-        df.groupby("session_id").cumcount()
-    )
+    # Remove invalid numeric values and non-positive prices.
+    finite_mask = np.isfinite(df[numeric_columns]).all(axis=1)
+    df = df[(df["mid_price"] > 0) & finite_mask].copy()
 
-    # Reject invalid prices and non-finite numeric values.
-    df = df[
-        (df["mid_price"] > 0)
-        & df[numeric_columns].apply(
-            lambda column: column.map(
-                lambda value: pd.notna(value)
-                and abs(value) != float("inf")
-            )
-        ).all(axis=1)
-    ].copy()
+    df = df.sort_values(["session_id", "timestamp"]).reset_index(drop=True)
 
-    df = df.sort_values(
-        ["session_id", "timestamp"]
-    ).reset_index(drop=True)
-
-    # Rebuild time indices after cleaning.
-    df["time_idx"] = (
-        df.groupby("session_id").cumcount()
-    )
+    # Rebuild the time index separately inside every session.
+    df["time_idx"] = df.groupby("session_id").cumcount()
 
     if df.empty:
-        raise ValueError(
-            "No usable data remains after numeric validation."
-        )
+        raise ValueError("No usable rows remain after validation.")
 
     print(f"Prepared rows: {len(df)}")
-    print(
-        f"Recording sessions: "
-        f"{df['session_id'].nunique()}"
-    )
+    print(f"Recording sessions: {df['session_id'].nunique()}")
     print("\nSession lengths:")
-    print(
-        df.groupby("session_id").size().to_string()
-    )
+    print(df.groupby("session_id").size().to_string())
 
     return df
 
 
 # ---------------------------------------------------------
-# Create training and validation datasets
+# Create chronological training and validation datasets
 # ---------------------------------------------------------
 
 def create_tft_datasets(df):
-    """Create chronological datasets from the longest session."""
+    """
+    Fit preprocessing on the training portion only.
+
+    Validation uses later observations from the same longest
+    continuous session, with encoder context from earlier rows.
+    """
 
     session_lengths = df.groupby("session_id").size()
 
-    minimum_rows = (
-        ENCODER_LENGTH + PREDICTION_LENGTH + 2
-    )
-
-    usable_sessions = session_lengths[
-        session_lengths >= minimum_rows
-    ]
+    minimum_rows = ENCODER_LENGTH + PREDICTION_LENGTH + 2
+    usable_sessions = session_lengths[session_lengths >= minimum_rows]
 
     if usable_sessions.empty:
         raise ValueError(
@@ -196,7 +138,6 @@ def create_tft_datasets(df):
             "Collect a longer continuous recording."
         )
 
-    # Avoid creating sequences across recording gaps.
     selected_session = usable_sessions.idxmax()
 
     session_df = (
@@ -206,33 +147,27 @@ def create_tft_datasets(df):
         .copy()
     )
 
-    split_idx = int(
-        len(session_df) * (1 - VALIDATION_FRACTION)
-    )
+    split_idx = int(len(session_df) * (1 - VALIDATION_FRACTION))
 
     if split_idx < ENCODER_LENGTH + PREDICTION_LENGTH:
-        raise ValueError(
-            "The training segment is too short for the "
-            "chosen encoder and prediction lengths."
-        )
+        raise ValueError("The training segment is too short.")
 
     training_df = session_df.iloc[:split_idx].copy()
 
-    # Include previous observations for the validation encoder.
-    validation_df = session_df.iloc[
-        split_idx - ENCODER_LENGTH:
-    ].copy()
+    # Include historical context, but validation prediction targets
+    # must start at or after split_idx.
+    validation_df = session_df.iloc[split_idx - ENCODER_LENGTH:].copy()
 
     dataset_kwargs = {
         "time_idx": "time_idx",
         "target": "mid_price",
         "group_ids": ["symbol"],
         "max_encoder_length": ENCODER_LENGTH,
+        "min_encoder_length": ENCODER_LENGTH,
         "max_prediction_length": PREDICTION_LENGTH,
+        "min_prediction_length": PREDICTION_LENGTH,
         "static_categoricals": ["symbol"],
-        "time_varying_known_reals": [
-            "time_idx",
-        ],
+        "time_varying_known_reals": ["time_idx"],
         "time_varying_unknown_reals": [
             "mid_price",
             "spread",
@@ -243,45 +178,40 @@ def create_tft_datasets(df):
             "orderbook_imbalance",
             "sentiment_score",
         ],
-        "target_normalizer": GroupNormalizer(
-            groups=["symbol"]
-        ),
+        "target_normalizer": GroupNormalizer(groups=["symbol"]),
         "add_relative_time_idx": True,
         "add_target_scales": True,
         "add_encoder_length": True,
         "allow_missing_timesteps": False,
     }
 
-    training_dataset = TimeSeriesDataSet(
-        training_df,
-        **dataset_kwargs,
-    )
+    training_dataset = TimeSeriesDataSet(training_df, **dataset_kwargs)
 
+    # Unlike predict=True, predict=False permits multiple validation
+    # windows. min_prediction_idx prevents training-period targets
+    # from being included in validation.
     validation_dataset = TimeSeriesDataSet.from_dataset(
         training_dataset,
         validation_df,
-        predict=True,
+        predict=False,
         stop_randomization=True,
+        min_prediction_idx=split_idx,
     )
 
     print(f"\nSelected session: {selected_session}")
-    print(f"Selected session rows: {len(session_df)}")
+    print(f"Session rows: {len(session_df)}")
     print(f"Training rows: {len(training_df)}")
-    print(
-        "Validation rows including encoder context: "
-        f"{len(validation_df)}"
-    )
+    print(f"Validation rows including encoder context: {len(validation_df)}")
     print(f"Training samples: {len(training_dataset)}")
     print(f"Validation samples: {len(validation_dataset)}")
 
     if len(training_dataset) == 0:
-        raise ValueError(
-            "No training samples were created."
-        )
+        raise ValueError("No training samples were created.")
 
     if len(validation_dataset) == 0:
         raise ValueError(
-            "No validation samples were created."
+            "No validation samples were created. "
+            "Check the session length and time index."
         )
 
     return training_dataset, validation_dataset
@@ -292,7 +222,7 @@ def create_tft_datasets(df):
 # ---------------------------------------------------------
 
 def build_tft_model(training_dataset):
-    """Build a small TFT model for the prototype."""
+    """Build the Temporal Fusion Transformer."""
 
     model = TemporalFusionTransformer.from_dataset(
         training_dataset,
@@ -306,9 +236,7 @@ def build_tft_model(training_dataset):
     )
 
     print("\nTFT model configured successfully.")
-    print(
-        f"Model parameters: {model.size() / 1000:.1f}K"
-    )
+    print(f"Model parameters: {model.size() / 1000:.1f}K")
 
     return model
 
@@ -317,12 +245,8 @@ def build_tft_model(training_dataset):
 # Train and save the best model
 # ---------------------------------------------------------
 
-def train_model(
-    model,
-    training_dataset,
-    validation_dataset,
-):
-    """Train TFT and save the best validation checkpoint."""
+def train_model(model, training_dataset, validation_dataset):
+    """Train TFT and save the checkpoint with the best validation loss."""
 
     train_loader = training_dataset.to_dataloader(
         train=True,
@@ -336,10 +260,7 @@ def train_model(
         num_workers=0,
     )
 
-    MODEL_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         dirpath=str(MODEL_DIR),
@@ -361,10 +282,7 @@ def train_model(
         accelerator="cpu",
         devices=1,
         gradient_clip_val=0.1,
-        callbacks=[
-            checkpoint_callback,
-            early_stopping,
-        ],
+        callbacks=[checkpoint_callback, early_stopping],
         logger=False,
         enable_progress_bar=True,
         enable_model_summary=True,
@@ -382,28 +300,23 @@ def train_model(
     best_checkpoint = checkpoint_callback.best_model_path
 
     if not best_checkpoint:
-        raise RuntimeError(
-            "Training finished without a best checkpoint."
-        )
+        raise RuntimeError("Training finished without a best checkpoint.")
 
     best_score = checkpoint_callback.best_model_score
 
     print(f"\nBest checkpoint: {best_checkpoint}")
     (MODEL_DIR / "best_checkpoint_path.txt").write_text(
-    best_checkpoint,
-    encoding="utf-8",
+        best_checkpoint,
+        encoding="utf-8",
     )
     print(f"Best validation loss: {best_score}")
 
-    # Load the best checkpoint before saving the state dictionary.
     best_model = TemporalFusionTransformer.load_from_checkpoint(
         best_checkpoint,
         map_location="cpu",
     )
 
-    weights_path = (
-        MODEL_DIR / "quantformer_tft_state.pt"
-    )
+    weights_path = MODEL_DIR / "quantformer_tft_state.pt"
 
     torch.save(
         {
@@ -427,31 +340,26 @@ def train_model(
 # ---------------------------------------------------------
 
 if __name__ == "__main__":
-    pl.seed_everything(
-        RANDOM_SEED,
-        workers=True,
-    )
+    pl.seed_everything(RANDOM_SEED, workers=True)
 
     print("Loading TFT forecasting data...")
     df = load_and_prepare_data()
 
     print("\nCreating training and validation datasets...")
-    training_dataset, validation_dataset = (
-        create_tft_datasets(df)
-    )
+    training_dataset, validation_dataset = create_tft_datasets(df)
 
     print("\nConfiguring TFT model...")
     model = build_tft_model(training_dataset)
 
-    print("\nDataset and model setup completed.")
-    print("Forecast target: mid_price")
+    print("\nForecast configuration:")
+    print("Target: mid_price")
+    print(f"Encoder length: {ENCODER_LENGTH} time steps")
     print(f"Prediction length: {PREDICTION_LENGTH} time steps")
+    print("The fifth decoder output is the five-minute-ahead forecast")
+    print("provided observations are sampled one minute apart.")
+
     print(
-        "Note: each step represents one minute only if "
-        "the data is sampled at one-minute intervals."
-    )
-    print(
-        "This is an experimental model, not a validated "
+        "\nNote: this model is experimental and is not a validated "
         "financial forecasting system."
     )
 
@@ -463,6 +371,4 @@ if __name__ == "__main__":
 
     print("\nTFT training completed successfully.")
     print(f"Best checkpoint: {best_checkpoint}")
-
-
 
