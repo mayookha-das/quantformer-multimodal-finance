@@ -49,7 +49,7 @@ def health():
 
 
 def get_checkpoint_path():
-    """Resolve and validate the saved TFT checkpoint."""
+    """Return the saved checkpoint path."""
     if not CHECKPOINT_FILE.exists():
         raise FileNotFoundError(
             "Checkpoint path file is missing. Train the TFT model first."
@@ -64,34 +64,66 @@ def get_checkpoint_path():
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_path}"
+            f"Checkpoint does not exist: {checkpoint_path}"
         )
 
     return checkpoint_path
 
 
-def get_latest_live_price():
-    """Read the latest valid mid-price from processed order-book data."""
+def get_latest_live_orderbook():
+    """
+    Read the newest valid order-book record.
+
+    This is reported separately from the TFT input window.
+    """
     if not ORDERBOOK_FILE.exists():
         return None
 
     try:
-        with ORDERBOOK_FILE.open("rb") as file:
-            file.seek(0, 2)
-            size = file.tell()
-            file.seek(max(0, size - 200_000))
-            chunk = file.read().decode("utf-8", errors="ignore")
+        with ORDERBOOK_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            # Process line-by-line to avoid loading the entire file.
+            latest = None
 
-        for line in reversed(chunk.splitlines()):
-            try:
-                row = json.loads(line)
-                price = float(
-                    row.get("mid_price", row.get("midPrice"))
+            for line in file:
+                if not line.strip():
+                    continue
+
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                price = record.get(
+                    "mid_price",
+                    record.get("midPrice"),
                 )
-                if np.isfinite(price) and price > 0:
-                    return price
-            except (ValueError, TypeError, json.JSONDecodeError):
-                continue
+
+                if price is None:
+                    continue
+
+                try:
+                    price = float(price)
+                except (TypeError, ValueError):
+                    continue
+
+                if not np.isfinite(price) or price <= 0:
+                    continue
+
+                timestamp = record.get("timestamp")
+
+                if timestamp is None:
+                    continue
+
+                latest = {
+                    "price": price,
+                    "timestamp": str(timestamp),
+                    "symbol": str(record.get("symbol", "MOCK")),
+                }
+
+            return latest
 
     except OSError:
         return None
@@ -100,24 +132,72 @@ def get_latest_live_price():
 
 
 def load_model_and_data():
-    """Load the saved model and build the current historical dataset."""
+    """
+    Build the historical dataset and load the trained TFT checkpoint.
+
+    The preprocessing and dataset configuration must remain compatible
+    with the configuration used during training.
+    """
     checkpoint_path = get_checkpoint_path()
 
     orderbook = prepare_orderbook()
     news = prepare_news()
     df = build_dataset(orderbook, news)
 
-    print("\n--- FORECAST INPUT CHECK ---")
-    print("Dataset rows:", len(df))
-    print("Latest timestamp:", df["timestamp"].max())
-    print("Latest historical mid-price:", df["mid_price"].iloc[-1])
-    print("Latest sentiment score:", df["sentiment_score"].iloc[-1])
-    print("Sentiment nonzero rows:", int((df["sentiment_score"].fillna(0) != 0).sum()))
-    print("Session lengths:")
-    print(df.groupby("session_id").size().to_string())
+    if df.empty:
+        raise ValueError(
+            "The combined order-book/news dataset is empty."
+        )
+
+    required_columns = {
+        "timestamp",
+        "time_idx",
+        "symbol",
+        "session_id",
+        "mid_price",
+        "sentiment_score",
+    }
+
+    missing = required_columns.difference(df.columns)
+
+    if missing:
+        raise ValueError(
+            f"Dataset is missing required columns: {sorted(missing)}"
+        )
+
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+    df["mid_price"] = pd.to_numeric(
+        df["mid_price"],
+        errors="coerce",
+    )
+    df["sentiment_score"] = pd.to_numeric(
+        df["sentiment_score"],
+        errors="coerce",
+    )
+    df = df.dropna(
+        subset=["timestamp", "mid_price", "time_idx", "session_id"]
+    )
 
     if df.empty:
-        raise ValueError("The combined order-book/news dataset is empty.")
+        raise ValueError(
+            "No valid historical rows remain after data cleaning."
+        )
+
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    print("\n--- QUANTFORMER FORECAST INPUT CHECK ---")
+    print("Dataset rows:", len(df))
+    print("Latest timestamp:", df["timestamp"].max())
+    print("Latest historical mid-price:", df.iloc[-1]["mid_price"])
+    print(
+        "Nonzero sentiment rows:",
+        int((df["sentiment_score"].fillna(0) != 0).sum()),
+    )
 
     training_dataset, _ = create_tft_datasets(df)
 
@@ -131,26 +211,44 @@ def load_model_and_data():
 
 
 def create_latest_prediction_loader(df, training_dataset):
-    """Build the latest encoder window and five future decoder rows."""
-    session_id = df.groupby("session_id").size().idxmax()
+    """
+    Build the most recent historical encoder window and decoder rows.
+
+    Future mid_price values are placeholders required by the dataset
+    interface. They are NOT observed future prices.
+
+    Other future covariates are also assumptions because their real
+    future values are unknown.
+    """
+    # Find the most recent session, not merely the longest session.
+    latest_session_id = (
+        df.sort_values("timestamp")
+        .iloc[-1]["session_id"]
+    )
 
     session_df = (
-        df[df["session_id"] == session_id]
+        df[df["session_id"] == latest_session_id]
         .sort_values("time_idx")
         .reset_index(drop=True)
         .copy()
     )
 
     required_rows = ENCODER_LENGTH + PREDICTION_LENGTH
+
     if len(session_df) < required_rows:
         raise ValueError(
-            f"Need at least {required_rows} rows in the selected session."
+            f"The latest session has {len(session_df)} rows. "
+            f"At least {required_rows} rows are required. "
+            "Collect more continuous order-book data."
         )
 
     encoder_df = session_df.tail(ENCODER_LENGTH).copy()
     last_row = encoder_df.iloc[-1].copy()
-    last_historical_price = float(last_row["mid_price"])
+    historical_price = float(last_row["mid_price"])
 
+    # Use the training dataset's feature configuration.
+    # The copied values below are explicit placeholder assumptions,
+    # not real future order-book/news observations.
     future_rows = []
 
     for step in range(1, PREDICTION_LENGTH + 1):
@@ -161,9 +259,10 @@ def create_latest_prediction_loader(df, training_dataset):
             + pd.Timedelta(minutes=step)
         )
 
-        # Placeholder target for the future decoder rows.
-        # These are not observed future prices.
-        row["mid_price"] = last_historical_price
+        # Required placeholder for the target column.
+        # It must not be interpreted as an actual future price.
+        row["mid_price"] = historical_price
+
         future_rows.append(row)
 
     window_df = pd.concat(
@@ -179,7 +278,10 @@ def create_latest_prediction_loader(df, training_dataset):
     )
 
     if len(prediction_dataset) == 0:
-        raise ValueError("Could not create a prediction window.")
+        raise ValueError(
+            "Could not create a prediction window. "
+            "Check the latest session and training dataset configuration."
+        )
 
     loader = prediction_dataset.to_dataloader(
         train=False,
@@ -187,7 +289,7 @@ def create_latest_prediction_loader(df, training_dataset):
         num_workers=0,
     )
 
-    return loader, last_row, last_historical_price
+    return loader, last_row, historical_price
 
 
 @app.get("/forecast")
@@ -195,10 +297,14 @@ def forecast():
     try:
         df, training_dataset, model = load_model_and_data()
 
-        loader, last_row, historical_price = create_latest_prediction_loader(
-            df,
-            training_dataset,
+        loader, last_row, historical_price = (
+            create_latest_prediction_loader(
+                df,
+                training_dataset,
+            )
         )
+
+        print("DEBUG 1: Starting model prediction...", flush=True)
 
         with torch.no_grad():
             prediction = model.predict(
@@ -206,15 +312,36 @@ def forecast():
                 mode="prediction",
             )
 
-        values = prediction[0].detach().cpu().numpy().reshape(-1)
-        live_price = get_latest_live_price()
+        print("DEBUG 2: Model prediction completed.", flush=True)
+
+        values = (
+            prediction[0]
+            .detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+        )
+
+        if len(values) != PREDICTION_LENGTH:
+            raise ValueError(
+                f"Expected {PREDICTION_LENGTH} predictions, "
+                f"but received {len(values)}."
+            )
+
+        live = get_latest_live_orderbook()
 
         return {
             "symbol": str(last_row["symbol"]),
             "last_observed_price": (
-                live_price if live_price is not None else historical_price
+                live["price"] if live else historical_price
             ),
-            "live_price_available": live_price is not None,
+            "live_price_available": live is not None,
+            "live_price_timestamp": (
+                live["timestamp"] if live else None
+            ),
+            "historical_input_timestamp": str(
+                pd.Timestamp(last_row["timestamp"])
+            ),
             "forecast_steps": [
                 {
                     "minutes_ahead": step,
@@ -223,11 +350,14 @@ def forecast():
                 for step, price in enumerate(values, start=1)
             ],
             "model": "Temporal Fusion Transformer",
+            "experimental": True,
+            "future_features_are_assumed": True,
             "note": (
-                "Experimental forecast. Current live price is reported "
-                "separately. The forecast uses the combined historical "
-                "dataset; it is not yet a verified live-input forecast. "
-                "Not trading advice."
+                "Experimental forecast from a historical TFT input window. "
+                "The current live order-book price is reported separately. "
+                "Future decoder features are placeholders, not observed "
+                "future data. The forecast is not yet validated as a "
+                "live-input prediction or trading signal."
             ),
         }
 
@@ -236,37 +366,6 @@ def forecast():
             status_code=500,
             detail=str(exc),
         ) from exc
-
-
-def importance_to_list(values, feature_names):
-    """Convert TFT importance tensors/arrays into named JSON values."""
-    if values is None:
-        return []
-
-    if hasattr(values, "detach"):
-        values = values.detach().cpu().numpy()
-
-    array = np.asarray(values).reshape(-1)
-    results = []
-
-    for index, value in enumerate(array):
-        name = (
-            str(feature_names[index])
-            if index < len(feature_names)
-            else f"feature_{index}"
-        )
-        results.append(
-            {
-                "feature": name,
-                "importance": float(value),
-            }
-        )
-
-    results.sort(
-        key=lambda item: item["importance"],
-        reverse=True,
-    )
-    return results
 
 
 @app.get("/interpretability")
@@ -280,56 +379,85 @@ def interpretability():
         )
 
         with torch.no_grad():
-            raw_prediction = model.predict(
-                loader,
-                mode="raw",
-                return_x=True,
+            interpretation = model.interpret_output(
+                model.predict(
+                    loader,
+                    mode="raw",
+                    return_x=True,
+                )[0],
+                reduction="sum",
             )
 
-        interpretation = model.interpret_output(
-            raw_prediction.output,
-            reduction="mean",
+        def importance_list(values):
+            if values is None:
+                return []
+
+            if isinstance(values, torch.Tensor):
+                values = values.detach().cpu().numpy()
+
+            values = np.asarray(values).reshape(-1)
+
+            names = list(
+                getattr(model, "encoder_variables", [])
+            )
+
+            result = []
+
+            for index, value in enumerate(values):
+                name = (
+                    str(names[index])
+                    if index < len(names)
+                    else f"feature_{index + 1}"
+                )
+
+                result.append({
+                    "feature": name,
+                    "importance": float(value),
+                })
+
+            return sorted(
+                result,
+                key=lambda item: item["importance"],
+                reverse=True,
+            )
+
+        encoder_importance = importance_list(
+            interpretation.get("encoder_variables")
         )
 
-        # Use the variable names supplied by the model, rather than
-        # assuming every variable is a real-valued feature.
-        encoder_names = list(
-            getattr(model, "encoder_variables", [])
-        )
-        decoder_names = list(
-            getattr(model, "decoder_variables", [])
-        )
-
-        encoder_importance = importance_to_list(
-            interpretation.get("encoder_variables"),
-            encoder_names,
-        )
-        decoder_importance = importance_to_list(
-            interpretation.get("decoder_variables"),
-            decoder_names,
+        decoder_importance = importance_list(
+            interpretation.get("decoder_variables")
         )
 
         attention = interpretation.get("attention")
-        if attention is not None:
-            if hasattr(attention, "detach"):
-                attention = attention.detach().cpu().numpy()
-            attention_values = np.asarray(attention).reshape(-1).tolist()
-        else:
+
+        if isinstance(attention, torch.Tensor):
+            attention = attention.detach().cpu().numpy()
+
+        if attention is None:
             attention_values = []
+        else:
+            attention_values = (
+                np.asarray(attention)
+                .reshape(-1)
+                .astype(float)
+                .tolist()
+            )
 
         return {
             "model": "Temporal Fusion Transformer",
             "symbol": str(last_row["symbol"]),
+            "historical_input_timestamp": str(
+                pd.Timestamp(last_row["timestamp"])
+            ),
             "encoder_feature_importance": encoder_importance,
             "decoder_feature_importance": decoder_importance,
-            "attention_weights": [
-                float(value) for value in attention_values
-            ],
+            "attention_weights": attention_values,
             "note": (
                 "Experimental interpretation of a historical input window. "
                 "Feature importance and attention do not establish causation. "
-                "Live news and order-book fusion must be independently "
-                "verified. Not trading advice."
+                "Future decoder features are assumed placeholders. "
+                "Not trading advice."
             ),
         }
 
@@ -338,3 +466,12 @@ def interpretability():
             status_code=500,
             detail=str(exc),
         ) from exc
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8000,
+    )
