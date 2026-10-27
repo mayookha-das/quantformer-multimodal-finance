@@ -11,6 +11,7 @@ from pytorch_forecasting import (
     TemporalFusionTransformer,
 )
 from pytorch_forecasting.data import GroupNormalizer
+from pytorch_forecasting.data.encoders import NaNLabelEncoder
 from pytorch_forecasting.metrics import MAE
 
 
@@ -119,54 +120,62 @@ def load_and_prepare_data():
 # Create chronological training and validation datasets
 # ---------------------------------------------------------
 
+
+
 def create_tft_datasets(df):
-    """
-    Fit preprocessing on the training portion only.
+    """Train on multiple sessions and validate on the latest session."""
 
-    Validation uses later observations from the same longest
-    continuous session, with encoder context from earlier rows.
-    """
-
-    session_lengths = df.groupby("session_id").size()
+    df = df.copy()
 
     minimum_rows = ENCODER_LENGTH + PREDICTION_LENGTH + 2
-    usable_sessions = session_lengths[session_lengths >= minimum_rows]
 
-    if usable_sessions.empty:
+    session_lengths = df.groupby("session_id").size()
+    usable_sessions = session_lengths[
+        session_lengths >= minimum_rows
+    ].index.tolist()
+
+    if len(usable_sessions) < 2:
         raise ValueError(
-            f"No session has at least {minimum_rows} rows. "
-            "Collect a longer continuous recording."
+            "At least two usable recording sessions are required."
         )
 
-    selected_session = usable_sessions.idxmax()
-
-    session_df = (
-        df[df["session_id"] == selected_session]
-        .sort_values("time_idx")
-        .reset_index(drop=True)
-        .copy()
+    session_order = (
+        df[df["session_id"].isin(usable_sessions)]
+        .groupby("session_id")["timestamp"]
+        .max()
+        .sort_values()
+        .index.tolist()
     )
 
-    split_idx = int(len(session_df) * (1 - VALIDATION_FRACTION))
+    validation_session = session_order[-1]
+    training_sessions = session_order[:-1]
 
-    if split_idx < ENCODER_LENGTH + PREDICTION_LENGTH:
-        raise ValueError("The training segment is too short.")
+    df["series_id"] = (
+        df["symbol"].astype(str)
+        + "_session_"
+        + df["session_id"].astype(str)
+    )
 
-    training_df = session_df.iloc[:split_idx].copy()
+    training_df = df[
+        df["session_id"].isin(training_sessions)
+    ].copy()
 
-    # Include historical context, but validation prediction targets
-    # must start at or after split_idx.
-    validation_df = session_df.iloc[split_idx - ENCODER_LENGTH:].copy()
+    validation_df = df[
+        df["session_id"] == validation_session
+    ].copy()
+
+    training_df["time_idx"] = (
+        training_df.groupby("series_id").cumcount()
+    )
+    validation_df["time_idx"] = (
+        validation_df.groupby("series_id").cumcount()
+    )
 
     dataset_kwargs = {
         "time_idx": "time_idx",
         "target": "mid_price",
-        "group_ids": ["symbol"],
-        "max_encoder_length": ENCODER_LENGTH,
-        "min_encoder_length": ENCODER_LENGTH,
-        "max_prediction_length": PREDICTION_LENGTH,
-        "min_prediction_length": PREDICTION_LENGTH,
-        "static_categoricals": ["symbol"],
+        "group_ids": ["series_id"],
+        "static_categoricals": ["symbol", "series_id"],
         "time_varying_known_reals": ["time_idx"],
         "time_varying_unknown_reals": [
             "mid_price",
@@ -178,43 +187,50 @@ def create_tft_datasets(df):
             "orderbook_imbalance",
             "sentiment_score",
         ],
-        "target_normalizer": GroupNormalizer(groups=["symbol"]),
+        "max_encoder_length": ENCODER_LENGTH,
+        "min_encoder_length": ENCODER_LENGTH,
+        "max_prediction_length": PREDICTION_LENGTH,
+        "min_prediction_length": PREDICTION_LENGTH,
+        "target_normalizer": GroupNormalizer(groups=[]),
+        "categorical_encoders": {
+            "series_id": NaNLabelEncoder(add_nan=True),
+            "symbol": NaNLabelEncoder(add_nan=True),
+        },
         "add_relative_time_idx": True,
         "add_target_scales": True,
         "add_encoder_length": True,
         "allow_missing_timesteps": False,
     }
 
-    training_dataset = TimeSeriesDataSet(training_df, **dataset_kwargs)
+    training_dataset = TimeSeriesDataSet(
+        training_df,
+        **dataset_kwargs,
+    )
 
-    # Unlike predict=True, predict=False permits multiple validation
-    # windows. min_prediction_idx prevents training-period targets
-    # from being included in validation.
     validation_dataset = TimeSeriesDataSet.from_dataset(
         training_dataset,
         validation_df,
         predict=False,
         stop_randomization=True,
-        min_prediction_idx=split_idx,
     )
 
-    print(f"\nSelected session: {selected_session}")
-    print(f"Session rows: {len(session_df)}")
-    print(f"Training rows: {len(training_df)}")
-    print(f"Validation rows including encoder context: {len(validation_df)}")
-    print(f"Training samples: {len(training_dataset)}")
-    print(f"Validation samples: {len(validation_dataset)}")
+    print("\nMulti-session dataset configuration")
+    print("Training sessions:", training_sessions)
+    print("Validation session:", validation_session)
+    print("Training rows:", len(training_df))
+    print("Validation rows:", len(validation_df))
+    print("Training samples:", len(training_dataset))
+    print("Validation samples:", len(validation_dataset))
 
-    if len(training_dataset) == 0:
-        raise ValueError("No training samples were created.")
-
-    if len(validation_dataset) == 0:
+    if len(training_dataset) == 0 or len(validation_dataset) == 0:
         raise ValueError(
-            "No validation samples were created. "
-            "Check the session length and time index."
+            "Training or validation dataset is empty. "
+            "Check session lengths and dataset configuration."
         )
 
     return training_dataset, validation_dataset
+
+
 
 
 # ---------------------------------------------------------
@@ -263,8 +279,8 @@ def train_model(model, training_dataset, validation_dataset):
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        dirpath=str(MODEL_DIR),
-        filename="quantformer-tft-{epoch:02d}-{val_loss:.4f}",
+        dirpath=str(MODEL_DIR / "multisession_experiment"),
+        filename="quantformer-tft-multi-{epoch:02d}-{val_loss:.4f}",
         monitor="val_loss",
         mode="min",
         save_top_k=1,
@@ -305,10 +321,23 @@ def train_model(model, training_dataset, validation_dataset):
     best_score = checkpoint_callback.best_model_score
 
     print(f"\nBest checkpoint: {best_checkpoint}")
-    (MODEL_DIR / "best_checkpoint_path.txt").write_text(
+    experiment_pointer = (
+        MODEL_DIR
+        / "multisession_experiment"
+        / "best_checkpoint_path.txt"
+    )
+
+    experiment_pointer.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    experiment_pointer.write_text(
         best_checkpoint,
         encoding="utf-8",
     )
+
+    print(f"Experiment checkpoint pointer saved to: {experiment_pointer}")
     print(f"Best validation loss: {best_score}")
 
     best_model = TemporalFusionTransformer.load_from_checkpoint(
@@ -316,7 +345,12 @@ def train_model(model, training_dataset, validation_dataset):
         map_location="cpu",
     )
 
-    weights_path = MODEL_DIR / "quantformer_tft_state.pt"
+    weights_path = (
+        MODEL_DIR
+        / "multisession_experiment"
+        / "quantformer_tft_state.pt"
+    )
+    weights_path.parent.mkdir(parents=True, exist_ok=True)
 
     torch.save(
         {

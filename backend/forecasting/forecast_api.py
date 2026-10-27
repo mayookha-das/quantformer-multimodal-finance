@@ -194,6 +194,27 @@ def load_model_and_data():
     print("Dataset rows:", len(df))
     print("Latest timestamp:", df["timestamp"].max())
     print("Latest historical mid-price:", df.iloc[-1]["mid_price"])
+
+    print("\n--- SESSION DIAGNOSTICS ---")
+
+    session_summary = (
+        df.groupby("session_id")
+        .agg(
+            rows=("mid_price", "size"),
+            first_price=("mid_price", "first"),
+            last_price=("mid_price", "last"),
+            latest_time=("timestamp", "max"),
+        )
+        .sort_values("latest_time")
+    )
+
+    print(session_summary.to_string())
+
+    print("\nLongest session ID:", df.groupby("session_id").size().idxmax())
+    print("Latest session ID:", df.sort_values("timestamp").iloc[-1]["session_id"])
+
+
+
     print(
         "Nonzero sentiment rows:",
         int((df["sentiment_score"].fillna(0) != 0).sum()),
